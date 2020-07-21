@@ -2,11 +2,22 @@
 import SwiftUI
 import AVKit
 
-public struct VideoPlayer<Content : View> : View {
-    let player: AVPlayer
-    let content: () -> Content
+public struct VideoPlayerContext {
+    public let player: AVPlayer
 
-    public init(player: AVPlayer, @ViewBuilder content: @escaping () -> Content) {
+    @Binding
+    public var isFullScreen: Bool
+}
+
+public struct VideoPlayer<Content : View> : View {
+    public typealias Context = VideoPlayerContext
+
+    let player: AVPlayer
+    let content: (Context) -> Content
+
+    public init(player: AVPlayer,
+                @ViewBuilder content: @escaping (Context) -> Content) {
+
         self.player = player
         self.content = content
     }
@@ -16,16 +27,22 @@ public struct VideoPlayer<Content : View> : View {
     }
 }
 
-private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentable {
-    let player: AVPlayer
-    let content: () -> Content
+extension VideoPlayer {
 
-    init(player: AVPlayer, @ViewBuilder content: @escaping () -> Content) {
+    public init(player: AVPlayer,
+                @ViewBuilder content: @escaping () -> Content) {
+
         self.player = player
-        self.content = content
+        self.content = { _ in content() }
     }
 
-    class UIViewControllerType : UIViewController {
+}
+
+private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentable {
+    let player: AVPlayer
+    let content: (VideoPlayerContext) -> Content
+
+    class UIViewControllerType : UIViewController, AVPlayerViewControllerDelegate {
         var player: AVPlayer!
         var content: Content! {
             didSet {
@@ -36,9 +53,15 @@ private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentab
         }
 
         private var playerViewController: AVPlayerViewController!
+        private var fullScreenViewController: UIViewController?
+
         private var isShowingOverlay = false
         private var previousContentViewController: UIViewController?
         private var timer: Timer?
+
+        private var isFullScreen = false
+        private lazy var fullScreenBinding = Binding(get: { [unowned self] in self.isFullScreen }, set: { [unowned self] in self.toggle(isFullScreen: $0) })
+        lazy var playerContext = VideoPlayerContext(player: player, isFullScreen: fullScreenBinding)
 
         deinit {
             timer?.invalidate()
@@ -50,6 +73,7 @@ private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentab
             playerViewController = AVPlayerViewController()
             playerViewController.player = player
             playerViewController.videoGravity = .resizeAspectFill
+            playerViewController.delegate = self
 
             // Layout child properly
             addChild(playerViewController)
@@ -73,31 +97,59 @@ private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentab
             }
         }
 
+        func toggle(isFullScreen: Bool) {
+            guard isFullScreen != self.isFullScreen else { return }
+            self.isFullScreen = isFullScreen
+            if isFullScreen {
+                playerViewController.toggle(isFullScreen: isFullScreen)
+            } else {
+                fullScreenViewController?.dismiss(animated: true)
+            }
+        }
+
         func updateShowingOverlay(animated: Bool = false) {
             if let previousContentViewController = previousContentViewController {
-                previousContentViewController.removeFromParent()
-                previousContentViewController.view.removeFromSuperview()
+                if animated {
+                    UIView.animate(withDuration: 0.3, animations: { previousContentViewController.view.alpha = 0 }) { _ in
+                        previousContentViewController.removeFromParent()
+                        previousContentViewController.view.removeFromSuperview()
+                    }
+                } else {
+                    previousContentViewController.removeFromParent()
+                    previousContentViewController.view.removeFromSuperview()
+                }
             }
 
+            let viewController = fullScreenViewController ?? playerViewController!
+
             if isShowingOverlay {
-                let contentViewController = UIHostingController(rootView: content)
+                let contentViewController = UIHostingController(rootView: content.edgesIgnoringSafeArea(isFullScreen ? .all : []))
+                if animated {
+                    contentViewController.view.alpha = 0
+                }
                 contentViewController.view.backgroundColor = .clear
                 contentViewController.view.translatesAutoresizingMaskIntoConstraints = false
 
-                playerViewController.addChild(contentViewController)
-                playerViewController.view.addSubview(contentViewController.view)
+                viewController.addChild(contentViewController)
+                viewController.view.addSubview(contentViewController.view)
 
                 let contraints = [
-                    playerViewController.view.leadingAnchor.constraint(equalTo: contentViewController.view.leadingAnchor),
-                    playerViewController.view.topAnchor.constraint(equalTo: contentViewController.view.topAnchor),
-                    playerViewController.view.trailingAnchor.constraint(equalTo: contentViewController.view.trailingAnchor),
-                    playerViewController.view.bottomAnchor.constraint(equalTo: contentViewController.view.bottomAnchor),
+                    viewController.view.leadingAnchor.constraint(equalTo: contentViewController.view.leadingAnchor),
+                    viewController.view.topAnchor.constraint(equalTo: contentViewController.view.topAnchor),
+                    viewController.view.trailingAnchor.constraint(equalTo: contentViewController.view.trailingAnchor),
+                    viewController.view.bottomAnchor.constraint(equalTo: contentViewController.view.bottomAnchor),
                 ]
 
                 NSLayoutConstraint.activate(contraints)
-                contentViewController.didMove(toParent: playerViewController)
+                contentViewController.didMove(toParent: viewController)
 
                 previousContentViewController = contentViewController
+
+                if animated {
+                    UIView.animate(withDuration: 0.3) {
+                        contentViewController.view.alpha = 1
+                    }
+                }
             } else {
                 previousContentViewController = nil
             }
@@ -116,6 +168,33 @@ private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentab
 
             updateShowingOverlay(animated: true)
         }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+
+
+            let previouslyShowingOverlay = isShowingOverlay
+            isShowingOverlay = false
+            updateShowingOverlay()
+
+            fullScreenViewController = coordinator.viewController(forKey: .to)
+            guard let fullScreenViewController = fullScreenViewController else { return }
+
+            // Setup custom controls
+            if Content.self != EmptyView.self {
+                playerViewController.showsPlaybackControls = false
+                let gesture = UITapGestureRecognizer(target: self, action: #selector(self.tapped(_:)))
+                fullScreenViewController.view.addGestureRecognizer(gesture)
+            }
+
+            isShowingOverlay = previouslyShowingOverlay
+            updateShowingOverlay()
+        }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+            fullScreenViewController = nil
+        }
     }
 
     func makeUIViewController(context: Context) -> UIViewControllerType {
@@ -126,6 +205,21 @@ private struct InternalVideoPlayer<Content : View> : UIViewControllerRepresentab
 
 
     func updateUIViewController(_ uiViewController: UIViewControllerType, context: Context) {
-        uiViewController.content = content()
+        uiViewController.content = content(uiViewController.playerContext)
     }
+}
+
+extension AVPlayerViewController {
+
+    fileprivate func toggle(isFullScreen: Bool, completionHandler: (() -> Void)? = nil) {
+        let selector = Selector(
+            isFullScreen ? "_transitionToFullScreenAnimated:interactive:completionHandler:" : "_transitionFromFullScreenAnimated:interactive:completionHandler:"
+        )
+
+        assert(responds(to: selector), "iOS just broke your App doofus!")
+        let imp = method(for: selector)!
+        let function = unsafeBitCast(imp, to: (@convention(c) (Any?, Bool, Bool, Any?) -> Void).self)
+        function(self, true, true, completionHandler)
+    }
+
 }
